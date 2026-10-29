@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# -*- coding: cp1252 -*-
+r"""
+
+Final depth-varying Manning's n script for HEC-RAS  modifies the geometry HDF:Final depth-varying Manning's n script for HEC-RAS 2D geometry HDF.
+    C:\YourProject\YourModel.g01.hdf
+
+What it does:
+    - Finds HEC-RAS 2D Faces Area Elevation Values table.
+    - Uses elevation table rows to estimate local depth for each face.
+    - Applies a HEC-15 inspired depth-varying Manning's n curve.
+    - Writes modified Manning's n values back to the HDF.
+    - CSV outputs, and a PDF report.
+
+Required packages:
+    pip install h5py numpy pandas reportlab
+
+"""
+
+import argparse
+import os
+import shutil
+import sys
+from datetime import datetime
+
+import h5py
+import numpy as np
+import pandas as pd
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+)
+
+
+# =============================================================================
+# USER DEFAULTS
+# =============================================================================
+
+DEFAULT_HDF_PATH = (
+    r"C:\YourProject\YourModel.g01.hdf"
+)
+
+# HEC-15 inspired Class C curve, feet
+HEC15_CLASS_C_CURVE_FEET = [
+    (0.02, 0.500),
+    (0.05, 0.500),
+    (0.10, 0.500),
+    (0.20, 0.500),
+    (0.50, 0.153),
+    (1.00, 0.070),
+    (2.00, 0.050),
+    (3.00, 0.044),
+]
+
+# Same curve, meters
+HEC15_CLASS_C_CURVE_METERS = [
+    (0.006, 0.500),
+    (0.015, 0.500),
+    (0.030, 0.500),
+    (0.061, 0.500),
+    (0.152, 0.153),
+    (0.305, 0.070),
+    (0.610, 0.050),
+    (0.914, 0.044),
+]
+
+DEFAULT_MIN_N = 0.025
+DEFAULT_MAX_N = 0.500
+
+
+# =============================================================================
+# BASIC HELPERS
+# =============================================================================
+
+def timestamp_string():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def make_backup(hdf_path):
+    folder = os.path.dirname(os.path.abspath(hdf_path))
+    base = os.path.basename(hdf_path)
+    backup_path = os.path.join(folder, f"{base}.backup_{timestamp_string()}")
+    shutil.copy2(hdf_path, backup_path)
+    return backup_path
+
+
+def visit_hdf_datasets(hdf):
+    datasets = []
+
+    def visitor(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            datasets.append(name)
+
+    hdf.visititems(visitor)
+    return datasets
+
+
+def find_values_datasets(hdf):
+    """
+    Finds only actual Faces Area Elevation Values tables.
+    This avoids accidentally processing Faces Area Elevation Info.
+    """
+    datasets = visit_hdf_datasets(hdf)
+    values_paths = []
+
+    for path in datasets:
+        if path.lower().endswith("faces area elevation values"):
+            values_paths.append(path)
+
+    return values_paths
+
+
+def find_info_dataset_for_values(hdf, values_path):
+    """
+    For:
+        Geometry/2D Flow Areas/Reservoir/Faces Area Elevation Values
+
+    find:
+        Geometry/2D Flow Areas/Reservoir/Faces Area Elevation Info
+    """
+    group = "/".join(values_path.split("/")[:-1])
+    expected_info_path = group + "/Faces Area Elevation Info"
+
+    if expected_info_path in hdf:
+        return expected_info_path
+
+    for path in visit_hdf_datasets(hdf):
+        if path.lower().endswith("faces area elevation info"):
+            if "/".join(path.split("/")[:-1]) == group:
+                return path
+
+    return None
+
+
+def read_numeric_matrix(ds):
+    """
+    Reads HDF dataset into numeric 2D matrix.
+    """
+    arr = ds[()]
+
+    if arr.dtype.names:
+        field_names = list(arr.dtype.names)
+        matrix = np.column_stack([arr[name] for name in field_names]).astype(float)
+        return matrix, True, field_names
+
+    if arr.ndim == 1:
+        matrix = arr.reshape(-1, 1).astype(float)
+    elif arr.ndim == 2:
+        matrix = arr.astype(float)
+    else:
+        raise ValueError(f"Unsupported dataset dimension: {arr.ndim}")
+
+    return matrix, False, None
+
+
+def write_numeric_matrix(ds, matrix, original_structured=False, field_names=None):
+    """
+    Writes modified numeric matrix back to original HDF dataset.
+    """
+    if original_structured:
+        out = np.empty(matrix.shape[0], dtype=ds.dtype)
+        for i, name in enumerate(field_names):
+            out[name] = matrix[:, i].astype(ds.dtype[name])
+        ds[...] = out
+    else:
+        if ds.ndim == 1:
+            ds[...] = matrix[:, 0].astype(ds.dtype)
+        else:
+            ds[...] = matrix.astype(ds.dtype)
+
+
+def stats_dict(values):
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+
+    if finite.size == 0:
+        return {
+            "min": np.nan,
+            "max": np.nan,
+            "mean": np.nan,
+            "median": np.nan,
+        }
+
+    return {
+        "min": float(np.nanmin(finite)),
+        "max": float(np.nanmax(finite)),
+        "mean": float(np.nanmean(finite)),
+        "median": float(np.nanmedian(finite)),
+    }
+
+
+# =============================================================================
+# CURVE FUNCTIONS
+# =============================================================================
+
+def parse_custom_curve(curve_text):
+    points = []
+
+    for pair in curve_text.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+
+        if ":" not in pair:
+            raise ValueError(f"Invalid curve point: {pair}. Use depth:n format.")
+
+        d_txt, n_txt = pair.split(":", 1)
+        depth = float(d_txt.strip())
+        n_value = float(n_txt.strip())
+        points.append((depth, n_value))
+
+    if len(points) < 2:
+        raise ValueError("At least two curve points are required.")
+
+    points = sorted(points, key=lambda x: x[0])
+
+    depths = np.array([p[0] for p in points], dtype=float)
+    n_values = np.array([p[1] for p in points], dtype=float)
+
+    if np.any(np.diff(depths) <= 0):
+        raise ValueError("Curve depths must be strictly increasing.")
+
+    return depths, n_values
+
+
+def get_curve(args):
+    if args.curve_points:
+        return parse_custom_curve(args.curve_points)
+
+    if args.units == "meter":
+        curve = HEC15_CLASS_C_CURVE_METERS
+    else:
+        curve = HEC15_CLASS_C_CURVE_FEET
+
+    depths = np.array([p[0] for p in curve], dtype=float)
+    n_values = np.array([p[1] for p in curve], dtype=float)
+
+    return depths, n_values
+
+
+def compute_depth_varying_n(depth, curve_depths, curve_n_values, min_n, max_n):
+    depth = np.asarray(depth, dtype=float)
+    depth = np.maximum(depth, 0.0)
+
+    n_values = np.interp(
+        depth,
+        curve_depths,
+        curve_n_values,
+        left=curve_n_values[0],
+        right=curve_n_values[-1],
+    )
+
+    n_values = np.clip(n_values, min_n, max_n)
+    return n_values
+
+
+# =============================================================================
+# FACE PROCESSING
+# =============================================================================
+
+def build_face_slices_from_info(info_matrix, total_value_rows):
+    """
+    HEC-RAS Faces Area Elevation Info normally has:
+        column 0 = start row in Values table
+        column 1 = row count for that face
+    """
+    if info_matrix.shape[1] < 2:
+        raise ValueError("Info table has fewer than 2 columns.")
+
+    starts = np.round(info_matrix[:, 0]).astype(int)
+    counts = np.round(info_matrix[:, 1]).astype(int)
+
+    face_slices = []
+
+    for face_index, (start, count) in enumerate(zip(starts, counts)):
+        if start < 0:
+            continue
+
+        if count <= 1:
+            continue
+
+        if start >= total_value_rows:
+            continue
+
+        end = min(start + count, total_value_rows)
+        actual_count = end - start
+
+        if actual_count <= 1:
+            continue
+
+        face_slices.append((face_index, start, actual_count))
+
+    return face_slices
+
+
+def process_values_dataset(hdf, values_path, args):
+    values_ds = hdf[values_path]
+    values_matrix, original_structured, field_names = read_numeric_matrix(values_ds)
+
+    if values_matrix.shape[1] < 4:
+        raise ValueError(
+            f"Values table /{values_path} has only {values_matrix.shape[1]} columns. "
+            "Expected at least 4 columns."
+        )
+
+    info_path = find_info_dataset_for_values(hdf, values_path)
+
+    if info_path is None:
+        raise ValueError(f"Could not find matching Info table for /{values_path}.")
+
+    info_ds = hdf[info_path]
+    info_matrix, _, _ = read_numeric_matrix(info_ds)
+
+    elev_col = args.elev_col
+    n_col = args.n_col
+
+    if elev_col < 0 or elev_col >= values_matrix.shape[1]:
+        raise ValueError(f"Invalid elevation column index: {elev_col}")
+
+    if n_col < 0 or n_col >= values_matrix.shape[1]:
+        raise ValueError(f"Invalid Manning's n column index: {n_col}")
+
+    elevations = values_matrix[:, elev_col].astype(float)
+    original_n = values_matrix[:, n_col].astype(float)
+
+    face_slices = build_face_slices_from_info(
+        info_matrix=info_matrix,
+        total_value_rows=values_matrix.shape[0],
+    )
+
+    if not face_slices:
+        raise ValueError("Could not build face slices from Info table.")
+
+    curve_depths, curve_n_values = get_curve(args)
+
+    new_n_all = original_n.copy()
+    all_depths = np.zeros_like(original_n, dtype=float)
+
+    audit_rows = []
+
+    for face_index, start, count in face_slices:
+        end = start + count
+
+        face_elev = elevations[start:end]
+        face_original_n = original_n[start:end]
+
+        local_min_elev = np.nanmin(face_elev)
+        local_depth = face_elev - local_min_elev
+        local_depth = np.maximum(local_depth, 0.0)
+
+        computed_n = compute_depth_varying_n(
+            depth=local_depth,
+            curve_depths=curve_depths,
+            curve_n_values=curve_n_values,
+            min_n=args.min_n,
+            max_n=args.max_n,
+        )
+
+        if args.keep_first_row:
+            computed_n[0] = face_original_n[0]
+
+        if args.keep_last_row:
+            computed_n[-1] = face_original_n[-1]
+
+        final_n = (args.blend * computed_n) + ((1.0 - args.blend) * face_original_n)
+        final_n = np.clip(final_n, args.min_n, args.max_n)
+
+        new_n_all[start:end] = final_n
+        all_depths[start:end] = local_depth
+
+        audit_rows.append(
+            {
+                "dataset": f"/{values_path}",
+                "face_index": face_index,
+                "start_row": start,
+                "row_count": count,
+                "min_elevation": float(np.nanmin(face_elev)),
+                "max_elevation": float(np.nanmax(face_elev)),
+                "max_estimated_depth_or_R": float(np.nanmax(local_depth)),
+                "original_n_min": float(np.nanmin(face_original_n)),
+                "original_n_max": float(np.nanmax(face_original_n)),
+                "original_n_mean": float(np.nanmean(face_original_n)),
+                "new_n_min": float(np.nanmin(final_n)),
+                "new_n_max": float(np.nanmax(final_n)),
+                "new_n_mean": float(np.nanmean(final_n)),
+                "delta_n_mean": float(np.nanmean(final_n - face_original_n)),
+            }
+        )
+
+    values_matrix[:, n_col] = new_n_all
+
+    if not args.preview:
+        write_numeric_matrix(
+            ds=values_ds,
+            matrix=values_matrix,
+            original_structured=original_structured,
+            field_names=field_names,
+        )
+
+    original_stats = stats_dict(original_n)
+    new_stats = stats_dict(new_n_all)
+    depth_stats = stats_dict(all_depths)
+
+    summary = {
+        "values_path": f"/{values_path}",
+        "info_path": f"/{info_path}",
+        "faces_modified": int(len(face_slices)),
+        "rows_modified": int(sum(c for _, _, c in face_slices)),
+        "elevation_column": int(elev_col),
+        "manning_n_column": int(n_col),
+        "blend": float(args.blend),
+        "keep_first_row": bool(args.keep_first_row),
+        "keep_last_row": bool(args.keep_last_row),
+        "original_n_min": original_stats["min"],
+        "original_n_max": original_stats["max"],
+        "original_n_mean": original_stats["mean"],
+        "original_n_median": original_stats["median"],
+        "new_n_min": new_stats["min"],
+        "new_n_max": new_stats["max"],
+        "new_n_mean": new_stats["mean"],
+        "new_n_median": new_stats["median"],
+        "delta_n_mean": float(new_stats["mean"] - original_stats["mean"]),
+        "estimated_depth_min": depth_stats["min"],
+        "estimated_depth_max": depth_stats["max"],
+        "estimated_depth_mean": depth_stats["mean"],
+    }
+
+    return summary, audit_rows
+
+
+# =============================================================================
+# PDF REPORT
+# =============================================================================
+
+def create_pdf_report(
+    pdf_path,
+    hdf_path,
+    backup_path,
+    summaries,
+    curve_depths,
+    curve_n_values,
+    args,
+):
+    styles = getSampleStyleSheet()
+    story = []
+
+    title = "HEC-RAS 2D Depth-Varying Manning's n Report"
+    story.append(Paragraph(title, styles["Title"]))
+    story.append(Spacer(1, 12))
+
+    mode_text = "PREVIEW ONLY - HDF was not modified" if args.preview else "APPLIED - HDF was modified"
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    intro_data = [
+        ["Run time", run_time],
+        ["Mode", mode_text],
+        ["HDF file", hdf_path],
+        ["Backup file", backup_path if backup_path else "No backup created"],
+        ["Units", args.units],
+        ["Blend", f"{args.blend:.3f}"],
+        ["Elevation column", str(args.elev_col)],
+        ["Manning's n column", str(args.n_col)],
+        ["Keep first row", str(args.keep_first_row)],
+        ["Keep last row", str(args.keep_last_row)],
+    ]
+
+    story.append(Paragraph("Run Information", styles["Heading2"]))
+    story.append(make_table(intro_data, col_widths=[130, 380]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Depth-Varying Manning's n Curve Used", styles["Heading2"]))
+
+    curve_data = [["Depth / Hydraulic Radius", "Manning's n"]]
+    for d, n in zip(curve_depths, curve_n_values):
+        curve_data.append([f"{d:.4f}", f"{n:.4f}"])
+
+    story.append(make_table(curve_data, col_widths=[220, 120], header=True))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("What Changed", styles["Heading2"]))
+    story.append(
+        Paragraph(
+            "The script modified the Manning's n column in the HEC-RAS 2D "
+            "Faces Area Elevation Values table. For each 2D cell face, local depth "
+            "was estimated as table-row elevation minus the minimum elevation for that face. "
+            "The depth-varying curve was then used to compute a new Manning's n value. "
+            "The final value was blended with the original Manning's n using the selected blend factor.",
+            styles["BodyText"],
+        )
+    )
+    story.append(Spacer(1, 12))
+
+    for i, summary in enumerate(summaries, start=1):
+        story.append(Paragraph(f"Dataset Summary {i}", styles["Heading2"]))
+
+        summary_data = [
+            ["Values table", summary["values_path"]],
+            ["Info table", summary["info_path"]],
+            ["Faces modified", f"{summary['faces_modified']:,}"],
+            ["Rows modified", f"{summary['rows_modified']:,}"],
+            ["Original n min", f"{summary['original_n_min']:.6f}"],
+            ["Original n max", f"{summary['original_n_max']:.6f}"],
+            ["Original n mean", f"{summary['original_n_mean']:.6f}"],
+            ["Original n median", f"{summary['original_n_median']:.6f}"],
+            ["New n min", f"{summary['new_n_min']:.6f}"],
+            ["New n max", f"{summary['new_n_max']:.6f}"],
+            ["New n mean", f"{summary['new_n_mean']:.6f}"],
+            ["New n median", f"{summary['new_n_median']:.6f}"],
+            ["Mean change in n", f"{summary['delta_n_mean']:.6f}"],
+            ["Estimated depth min", f"{summary['estimated_depth_min']:.6f}"],
+            ["Estimated depth max", f"{summary['estimated_depth_max']:.6f}"],
+            ["Estimated depth mean", f"{summary['estimated_depth_mean']:.6f}"],
+        ]
+
+        story.append(make_table(summary_data, col_widths=[160, 350]))
+        story.append(Spacer(1, 12))
+
+    story.append(PageBreak())
+    story.append(Paragraph("Recommended Next Steps", styles["Heading2"]))
+
+    next_steps = [
+        "Open HEC-RAS and use the copied geometry/plan associated with this HDF.",
+        "Do not recompute 2D hydraulic property tables unless you plan to rerun this script.",
+        "Run the copied plan.",
+        "Compare hydrograph timing, peak flow, total volume, depth grid, velocity grid, and Courant grid.",
+        "If the model response becomes too delayed, rerun from backup using a lower blend value.",
+        "If the model is still too flashy, rerun from backup using a higher blend value.",
+    ]
+
+    for step in next_steps:
+        story.append(Paragraph(f"• {step}", styles["BodyText"]))
+        story.append(Spacer(1, 4))
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    doc.build(story)
+
+
+def make_table(data, col_widths=None, header=False):
+    table = Table(data, colWidths=col_widths, repeatRows=1 if header else 0)
+
+    style = [
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+
+    if header:
+        style.extend(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+
+    table.setStyle(TableStyle(style))
+    return table
+
+
+# =============================================================================
+# OUTPUT FILES
+# =============================================================================
+
+def save_outputs(hdf_path, summaries, audit_rows, args):
+    folder = os.path.dirname(os.path.abspath(hdf_path))
+    base = os.path.basename(hdf_path)
+    mode_text = "preview" if args.preview else "applied"
+
+    summary_csv = os.path.join(folder, f"{base}_depth_varying_n_{mode_text}_summary.csv")
+    audit_csv = os.path.join(folder, f"{base}_depth_varying_n_{mode_text}_audit.csv")
+    pdf_report = os.path.join(folder, f"{base}_depth_varying_n_{mode_text}_report.pdf")
+
+    pd.DataFrame(summaries).to_csv(summary_csv, index=False)
+    pd.DataFrame(audit_rows).to_csv(audit_csv, index=False)
+
+    return summary_csv, audit_csv, pdf_report
+
+
+# =============================================================================
+# ARGUMENTS
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Apply depth-varying Manning's n to HEC-RAS 2D Faces Area Elevation Values."
+    )
+
+    parser.add_argument(
+        "hdf_path",
+        nargs="?",
+        default=DEFAULT_HDF_PATH,
+        help="Path to HEC-RAS geometry HDF. If omitted, uses default .g03 copied/safe HDF.",
+    )
+
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Preview only. Do not modify the HDF.",
+    )
+
+    parser.add_argument(
+        "--units",
+        choices=["feet", "meter"],
+        default="feet",
+        help="Model units for curve depths. Default: feet.",
+    )
+
+    parser.add_argument(
+        "--blend",
+        type=float,
+        default=0.50,
+        help="Blend factor between original n and curve n. Default: 0.50.",
+    )
+
+    parser.add_argument(
+        "--elev-col",
+        type=int,
+        default=0,
+        help="Elevation column in Faces Area Elevation Values. Default: 0.",
+    )
+
+    parser.add_argument(
+        "--n-col",
+        type=int,
+        default=3,
+        help="Manning's n column in Faces Area Elevation Values. Default: 3.",
+    )
+
+    parser.add_argument(
+        "--min-n",
+        type=float,
+        default=DEFAULT_MIN_N,
+        help="Minimum allowed Manning's n. Default: 0.025.",
+    )
+
+    parser.add_argument(
+        "--max-n",
+        type=float,
+        default=DEFAULT_MAX_N,
+        help="Maximum allowed Manning's n. Default: 0.500.",
+    )
+
+    parser.add_argument(
+        "--curve-points",
+        default=None,
+        help=(
+            "Optional custom curve as depth:n pairs. "
+            "Example: 0.02:0.50,0.05:0.50,0.50:0.153,1.00:0.070"
+        ),
+    )
+
+    parser.add_argument(
+        "--keep-first-row",
+        action="store_true",
+        help="Keep original n for first row of each face table.",
+    )
+
+    parser.add_argument(
+        "--modify-last-row",
+        action="store_true",
+        help="Modify deepest/last row. By default, deepest row is kept unchanged.",
+    )
+
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Skip backup. Not recommended.",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    args = parse_args()
+
+    hdf_path = args.hdf_path
+
+    # Safer default: keep deepest/last row unchanged unless user explicitly modifies it.
+    args.keep_last_row = not args.modify_last_row
+
+    if not os.path.isfile(hdf_path):
+        print("\nERROR: HDF file not found.")
+        print(f"Path used:\n  {hdf_path}")
+        sys.exit(1)
+
+    if args.blend < 0.0 or args.blend > 1.0:
+        print("\nERROR: --blend must be between 0.0 and 1.0.")
+        sys.exit(1)
+
+    if args.min_n <= 0 or args.max_n <= 0 or args.min_n >= args.max_n:
+        print("\nERROR: Invalid --min-n and --max-n values.")
+        sys.exit(1)
+
+    print("\n======================================================")
+    print("HEC-RAS 2D Depth-Varying Manning's n Tool")
+    print("Final Version with PDF Report")
+    print("======================================================")
+    print(f"HDF file: {hdf_path}")
+    print(f"Mode: {'PREVIEW ONLY - HDF will not be modified' if args.preview else 'APPLY - HDF will be modified'}")
+    print(f"Units: {args.units}")
+    print(f"Blend: {args.blend}")
+    print(f"Elevation column: {args.elev_col}")
+    print(f"Manning's n column: {args.n_col}")
+    print(f"Keep first row: {args.keep_first_row}")
+    print(f"Keep last row: {args.keep_last_row}")
+
+    curve_depths, curve_n_values = get_curve(args)
+
+    print("\nCurve used:")
+    for d, n in zip(curve_depths, curve_n_values):
+        print(f"  Depth/R = {d:.4f}, n = {n:.4f}")
+
+    backup_path = None
+
+    if not args.preview and not args.no_backup:
+        backup_path = make_backup(hdf_path)
+        print("\nBackup created:")
+        print(f"  {backup_path}")
+    elif not args.preview and args.no_backup:
+        print("\nWARNING: Backup skipped because --no-backup was used.")
+
+    mode = "r" if args.preview else "r+"
+
+    summaries = []
+    audit_rows = []
+
+    try:
+        with h5py.File(hdf_path, mode) as hdf:
+            values_paths = find_values_datasets(hdf)
+
+            if not values_paths:
+                print("\nERROR: No Faces Area Elevation Values dataset found.")
+                print("Datasets containing 'faces area elevation':")
+                for path in visit_hdf_datasets(hdf):
+                    if "faces area elevation" in path.lower():
+                        print(f"  /{path}")
+                sys.exit(1)
+
+            print("\nFound Faces Area Elevation Values dataset(s):")
+            for path in values_paths:
+                print(f"  /{path}")
+
+            for values_path in values_paths:
+                print("\n------------------------------------------------------")
+                print(f"Processing: /{values_path}")
+
+                summary, audit = process_values_dataset(
+                    hdf=hdf,
+                    values_path=values_path,
+                    args=args,
+                )
+
+                summaries.append(summary)
+                audit_rows.extend(audit)
+
+                print("\nChange summary:")
+                print(f"  Faces modified: {summary['faces_modified']:,}")
+                print(f"  Rows modified: {summary['rows_modified']:,}")
+                print(f"  Original n mean: {summary['original_n_mean']:.6f}")
+                print(f"  New n mean: {summary['new_n_mean']:.6f}")
+                print(f"  Original n range: {summary['original_n_min']:.6f} to {summary['original_n_max']:.6f}")
+                print(f"  New n range: {summary['new_n_min']:.6f} to {summary['new_n_max']:.6f}")
+
+    except OSError as e:
+        print("\nERROR: Could not open HDF file.")
+        print(str(e))
+        print("\nClose HEC-RAS if it is open, then try again.")
+        sys.exit(1)
+
+    if summaries:
+        summary_csv, audit_csv, pdf_report = save_outputs(hdf_path, summaries, audit_rows, args)
+
+        create_pdf_report(
+            pdf_path=pdf_report,
+            hdf_path=hdf_path,
+            backup_path=backup_path,
+            summaries=summaries,
+            curve_depths=curve_depths,
+            curve_n_values=curve_n_values,
+            args=args,
+        )
+
+        print("\nOutput files created:")
+        print(f"  Summary CSV: {summary_csv}")
+        print(f"  Audit CSV:   {audit_csv}")
+        print(f"  PDF Report:  {pdf_report}")
+
+    print("\nDone.")
+
+    if args.preview:
+        print("\nPreview completed. No HDF values were changed.")
+        print("To apply changes, run:")
+        print("  python Depth_n.py")
+    else:
+        print("\nNext steps:")
+        print("  1) Open HEC-RAS.")
+        print("  2) Use the copied .g03 geometry/plan.")
+        print("  3) Do not recompute 2D hydraulic property tables unless you rerun this script.")
+        print("  4) Run the copied plan.")
+        print("  5) Review hydrograph timing, peak, depth grid, velocity grid, and Courant grid.")
+        print("  6) Open the PDF report to see exactly what changed.")
+
+
+if __name__ == "__main__":
+    main()
+
